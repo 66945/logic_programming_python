@@ -2,7 +2,8 @@ from __future__ import annotations
 import inspect
 import itertools
 from dataclasses import dataclass
-from typing import Callable, Iterable, Iterator
+from typing import Callable, Iterable, Iterator, Hashable
+import re
 
 if True:
     def dprint(*args):
@@ -47,7 +48,7 @@ class BackTrace:
     def current_choice(self, options: Options):
         route_top = len(self.decision_route) - 1
 
-        if self.cursor is None              \
+        if self.cursor is None             \
                 or self.cursor > route_top \
                 or len(self.decision_route) == 0:
 
@@ -374,6 +375,7 @@ class Domain:
 
         return Domain(new_terms, new_numeric, new_string)
 
+    # FIXME: xor should work as a reflection of and
     def __xor__(self, other):
         new_terms   = self._terms ^ other._terms
         new_numeric = []
@@ -381,7 +383,7 @@ class Domain:
             new_numeric = other._numeric
         elif self._numeric != []:
             new_numeric = self._numeric
-        return Domain(new_terms, new_numeric)
+        return Domain(new_terms, new_numeric, string=self._string)
 
     def empty(self) -> bool:
         return self._terms == set() \
@@ -433,7 +435,7 @@ class LazyCapture:
 
 def add_left(val):
     if type(val) == int:
-        return Domain(set(), numeric=[range(val)], string=None)
+        return Domain(set(), numeric=[range(val + 1)], string=None)
     elif type(val) == str:
         strings = [val[:i] for i in range(len(val))]
         return Domain(set(), numeric=[], string=[*strings])
@@ -449,52 +451,49 @@ class Variable:
         if domain == None:
             domain_set = { True, False }
 
-            for v in globe.values():
+            for v in fact_set:
                 if type(v) in term_types:
                     domain_set.add(v)
             
             domain = Domain(domain_set)
 
-        self.name            = name
-        self._capture        = Capture(domain)
-        self._initial_domain = domain
+        self.name              = name
+        self._capture: Capture = Capture(domain)
+        self._initial_domain   = domain
+
+    def __instancecheck__(self, instance):
+        ...
 
     def __eq__(self, value: object) -> bool:
         is_binding = type(value) == Variable
-        current    = trace.current_choice(Options('__eq__', iter([True, False])))
 
         if not is_binding:
-            if current:
-                if type(self._capture) == LazyCapture:
-                    self._capture.select(value)
-                    return True
-
-                self.restrict({value})
-
-                assert self._capture.domain
+            if type(self._capture) == LazyCapture:
+                self._capture.select(value)
                 return True
 
-            else:
-                if type(self._capture) == LazyCapture:
-                    return False
-
-                self.exclude({value})
-                assert self._capture.domain
+            old_domain = self._capture.domain
+            self.restrict({value})
+            if not bool(self._capture.domain):
+                self._capture.domain = old_domain
                 return False
+            return True
 
         else:
-            if current:
-                intersection = self._capture.domain & value._capture.domain
-                assert intersection
+            intersection = self._capture.domain & value._capture.domain
 
+            if bool(intersection):
                 bound = Capture(intersection)
                 self._capture  = bound
                 value._capture = bound
-
                 return True
-            else:
-                # TODO
-                return False
+            return False
+
+    def __matmul__(self, other):
+        assert self == other
+        return True
+    def __rmatmul__(self, other):
+        return self @ other
 
     def __add__(self, other):
         if type(other) == Variable:
@@ -509,12 +508,33 @@ class Variable:
         )
 
         add_var = Variable('__add__', self._capture.domain)
-        add_var._capture = lazy
+        add_var._capture = lazy # type: ignore
 
         return add_var
 
     def __radd__(self, other):
         return self.__add__(other)
+
+    def __len__(self):
+        self._capture.domain = Domain(
+            terms   = set(),
+            numeric = [],
+            string  = self._capture.domain._string
+        )
+        assert self._capture.domain
+
+        lazy = LazyCapture(
+            left  = self._capture,
+            right = None,
+
+            pick_left  = None,
+            pick_right = (lambda val, _: Domain(set(), [], ['*' * val])),
+        )
+
+        len_var = Variable('__len__', Domain(set()))
+        len_var._capture = lazy # type: ignore
+
+        return len_var
 
     def __str__(self) -> str:
         # uh oh
@@ -579,6 +599,18 @@ class Variable:
         self._capture.domain = self._capture.domain ^ new_domain
 
 
+# domain vs seperate class?
+class Output:
+    def __init__(self, content):
+        self._content = content
+
+    def __iter__(self) -> Iterator:
+        return iter(self._content)
+
+    def __bool__(self) -> bool:
+        return next(iter(self._content), None) is not None
+
+
 class Predicate:
     def __init__(self):
         self._facts = set()
@@ -631,7 +663,7 @@ class Predicate:
         return key
 
 def var():
-    return Variable('unique')
+    return Variable('__var__')
 
 
 class PredicatesContainer:
@@ -644,7 +676,6 @@ class PredicatesContainer:
 
 p = PredicatesContainer()
 
-
 def setup_predicates(fn):
     g = inspect.currentframe().f_back.f_globals # type: ignore
     while True:
@@ -655,6 +686,22 @@ def setup_predicates(fn):
             g[ne.name] = Predicate() # type: ignore
             continue
         break
+
+fact_set = set()
+
+def fact(clazz):
+    global fact_set
+
+    t = dataclass(frozen=True)(clazz)
+    term_types.append(t)
+
+    def _init(*args, **kwargs):
+        inst = t(*args, **kwargs)
+        fact_set.add(inst)
+        return inst
+
+    return _init
+
 
 globe = {}
 def use(g: dict):
@@ -670,10 +717,12 @@ def rule(fn) -> Callable:
     fn_name   = fn.__name__
     fn_params = list(signature.parameters.items())
 
-    def f(*args):
+    def iterator(*args):
         args         = list(args)
         call_count   = 0
         start_cursor = trace.cursor
+
+        temporary_names = set()
 
         if fn_name in p._predicates:
             for tup in p._predicates[fn_name](*args):
@@ -681,13 +730,10 @@ def rule(fn) -> Callable:
                 yield out_fmt
 
         while True:
-            if fn_name in p._predicates:
-                for tup in p._predicates[fn_name](*args):
-                    out_fmt = tuple([f'{fn_params[i][0]} = {o}' for i, o in enumerate(tup)])
-                    yield out_fmt
-
             args_variable = []
             variables     = []
+
+            name_error = False
 
             for i, arg in enumerate(args):
                 if type(arg) == Variable:
@@ -714,8 +760,8 @@ def rule(fn) -> Callable:
                         ...
 
                     else:
-                        for v in globe.values():
-                            if type(v) == annotation:
+                        for v in fact_set:
+                            if isinstance(v, Hashable):
                                 domain_set.add(v)
                         new_domain = Domain(domain_set)
 
@@ -752,6 +798,13 @@ def rule(fn) -> Callable:
                     out_fmt   = tuple([f'{fn_params[i][0]} = {o}' for i, o in enumerate(out_deref)])
                     yield out_fmt
 
+            except NameError as e:
+                temporary_names.add(e.name)
+                trace.cursor         = start_cursor
+                trace.decision_route = []
+                name_error           = True
+                continue
+
             except AssertionError as e:
                 continue
 
@@ -760,23 +813,36 @@ def rule(fn) -> Callable:
 
             finally:
                 trace.clear()
-                if len(trace.decision_route) == start_cursor:
-                    trace.cursor = start_cursor
-                    return
+                for n in temporary_names:
+                    globe[n] = var()
+
+                if not name_error and len(trace.decision_route) == start_cursor:
+                    break
+
+        trace.cursor = start_cursor
+        for n in temporary_names:
+            del globe[n]
+
+    def f(*args):
+        return Output()
 
     return f
 
+class AssertSyntax:
+    def __matmul__(self, other):
+        for cond in other:
+            assert cond
+        return True
 
-
-
+T = AssertSyntax()
 
 
 # =================================================================
 
 
+def repl(_globals):
+    use(_globals)
 
-
-def repl():
     print('\033[2J\033[H')
     query = ''
     while query != 'exit':
@@ -792,16 +858,23 @@ def repl():
                     query = input(' >  ')
 
                 print('\033[A\033[2K')
-                exec(code, globals=globals(), locals=globals())
+                exec(code, _globals, _globals)
+
             elif query == '':
                 print('\033[A\033[2K')
 
+            elif ':-' in query:
+                code = re.sub(r'([a-zA-Z_])+\s*\((.*)\)\s*:-(.*)', r'\1 = rule(lambda \2: T @ (\3,))', query)
+                exec(code, _globals, _globals)
+
             else:
                 valid = False
-                for i in eval(query, globals=globals(), locals=globals()):
+                for i in eval(query, _globals, _globals):
                     valid = True
                     fmt   = '\n │  '.join([str(a) for a in i])
                     if input(f' │  {fmt} '):
+                        trace.decision_route = []
+                        trace.cursor         = 0
                         break
                     print(' │')
 

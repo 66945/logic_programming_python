@@ -1,19 +1,27 @@
-from predicate   import *
+# type: ignore
+
+import builtins
+from predicate import *
 from dataclasses import dataclass
 
-@dataclass(frozen=True)
+# redefine len() to allow for non int returns
+def _len(n):
+    return n.__len__()
+builtins.len = _len
+
+
+
+@fact
 class UnitTest:
-    valid: str
-    test:  tuple
+    valid:     str
+    test:      tuple
     name_real: str
 
-term_types.append(UnitTest)
-
-test1 = UnitTest('yes', (), 'test1')
-test2 = UnitTest('yes', (), 'test2')
-test3 = UnitTest('no',  (), 'test3')
-test4 = UnitTest('yes', (), 'test7')
-test5 = UnitTest('no',  (), 'other')
+UnitTest('yes', (), 'test1')
+UnitTest('yes', (), 'test2')
+UnitTest('no',  (), 'test3')
+UnitTest('yes', (), 'test7')
+UnitTest('no',  (), 'other')
 
 @rule
 def zero(a: int):
@@ -59,6 +67,30 @@ def email(user: str, domain: str, tld: str, address: str):
     assert regex_test(email_regex, address)
 
 
+@rule
+def length(string: str, length: int):
+    assert len(string) == length
+
+@fact
+class Parent:
+    child:  str
+    parent: str
+
+Parent('daniel', 'kathy')
+Parent('daniel', 'micheal')
+Parent('maggie', 'kathy')
+Parent('maggie', 'micheal')
+
+@rule
+def sibling(a: str, b: str):
+    T @ (
+        y.parent == z.parent,
+
+        a == y.child,
+        b == z.child,
+        a != b
+    )
+
+
 if __name__ == '__main__':
-    use(globals())
-    repl()
+    repl(globals())
