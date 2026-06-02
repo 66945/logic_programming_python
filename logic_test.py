@@ -27,3 +27,8 @@ arr(0, arr(2, arr(2, arr(3, None))))
 
 for item in arr(0, ...).proxy._domain:
     print(item)
+
+print('\n---\n')
+
+for item in arr(0, arr(1, ...)).proxy._domain:
+    print(item)

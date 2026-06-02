@@ -92,7 +92,7 @@ class Terms(SolutionSpace):
                 self._domain.add(fact)
 
     def __contains__(self, item) -> bool:
-        return item in database.values()
+        return item in self._domain
 
     def __iter__(self): # type: ignore
         return iter(self._domain)
