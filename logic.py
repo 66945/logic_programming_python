@@ -224,6 +224,10 @@ def query(name: str, members: list[str]):
                         matches = False
                         break
 
+                    if isinstance(val, Variable) and getattr(fact, field) not in val.proxy._domain:
+                        matches = False
+                        break
+
                 if matches:
                     matching.add(fact)
 

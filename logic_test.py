@@ -25,5 +25,5 @@ class arr:
 arr(0, arr(1, arr(2, arr(3, None))))
 arr(0, arr(2, arr(2, arr(3, None))))
 
-for item in arr(0, arr(1, ...)).proxy._domain:
+for item in arr(0, ...).proxy._domain:
     print(item)
