@@ -2,7 +2,7 @@ from __future__ import annotations
 import inspect
 import itertools
 from dataclasses import dataclass
-from typing import Callable, Iterable, Iterator, Hashable
+from typing import Any, Callable, Iterable, Iterator, Hashable
 import re
 
 if True:
@@ -41,9 +41,6 @@ class BackTrace:
             else:
                 self.decision_route[-1].current = current
                 return
-
-    def push(self, options: Options):
-        self.decision_route.append(options)
 
     def current_choice(self, options: Options):
         route_top = len(self.decision_route) - 1
@@ -390,8 +387,6 @@ class Domain:
             and self._numeric == [] \
             and self._string  == None
 
-term_types = []
-
 
 class Capture:
     uid = 0
@@ -405,6 +400,7 @@ class Capture:
     def __hash__(self) -> int:
         return self._uid
 
+# TODO: maybe this should be LazyDomain
 class LazyCapture:
     def __init__(self, left: Capture, right: Capture | object, pick_left, pick_right):
         self._left  = left
@@ -414,6 +410,16 @@ class LazyCapture:
         self._pick_last  = pick_right
 
     def select(self, val):
+        lazy_left  = None
+        lazy_right = None
+
+        if isinstance(self._left, LazyCapture):
+            lazy_left  = self._left
+            self._left = var()._capture
+
+#        if isinstance(self._right, LazyCapture):
+#            self._right = self._right.select(val)
+
         if not isinstance(self._right, Capture):
             self._left.domain = self._pick_last(val, self._right)
 
@@ -422,6 +428,9 @@ class LazyCapture:
             assert self._left.domain
 
             current = trace.current_choice(Options('select', iter(self._left.domain)))
+            if lazy_left:
+                lazy_left.select(current)
+
             if type(current) == int:
                 self._left.domain = Domain(set(), numeric=[current], string=None)
             elif type(current) == str:
@@ -452,17 +461,13 @@ class Variable:
             domain_set = { True, False }
 
             for v in fact_set:
-                if type(v) in term_types:
-                    domain_set.add(v)
+                domain_set.add(v)
             
             domain = Domain(domain_set)
 
         self.name              = name
         self._capture: Capture = Capture(domain)
         self._initial_domain   = domain
-
-    def __instancecheck__(self, instance):
-        ...
 
     def __eq__(self, value: object) -> bool:
         is_binding = type(value) == Variable
@@ -498,7 +503,7 @@ class Variable:
     def __add__(self, other):
         if type(other) == Variable:
             other = other._capture
-        
+
         lazy = LazyCapture(
             left  = self._capture,
             right = other,
@@ -507,7 +512,7 @@ class Variable:
             pick_right = add_right
         )
 
-        add_var = Variable('__add__', self._capture.domain)
+        add_var = Variable('__add__', None)
         add_var._capture = lazy # type: ignore
 
         return add_var
@@ -601,20 +606,26 @@ class Variable:
 
 # domain vs seperate class?
 class Output:
-    def __init__(self, content):
-        self._content = content
+    def __init__(self, outputs):
+        self._outputs_condensed = outputs
 
     def __iter__(self) -> Iterator:
-        return iter(self._content)
+        def I():
+            for out in lazy_product(*self._outputs_condensed):
+                out_deref = tuple([out[o.cap] if type(o) == Ref else o for o in out])
+                yield out_deref
+        
+        return I()
 
     def __bool__(self) -> bool:
-        return next(iter(self._content), None) is not None
+        return False
 
 
 class Predicate:
     def __init__(self):
         self._facts = set()
 
+    # TODO: restructure return to work better for Output class
     def __call__(self, *key) -> set:
         key           = tuple(key)
         possibilities = set()
@@ -689,18 +700,76 @@ def setup_predicates(fn):
 
 fact_set = set()
 
-def fact(clazz):
+class FactMeta(type):
+    def __instancecheck__(cls, instance: Any) -> bool:
+        if type(instance) == Variable:
+            current = trace.current_choice(Options('instance check', iter([True, False])))
+
+            if current:
+                subset = {
+                    t
+                        for t in instance._capture.domain._terms
+                        if type(t).__name__ == cls.__name__
+                }
+
+                instance.restrict(subset)
+                return bool(instance._capture.domain)
+            else:
+                subset = {
+                    t
+                        for t in instance._capture.domain._terms
+                        if type(t).__name__ == cls.__name__
+                }
+
+                instance._capture.domain._terms ^= subset
+                return not bool(instance._capture.domain)
+
+        return False
+
+
+def fact(clazz: type):
     global fact_set
 
-    t = dataclass(frozen=True)(clazz)
-    term_types.append(t)
+    members = {
+        k: None
+            for k in clazz.__annotations__
+    }
+    members |= {
+        k: v
+            for k, v in vars(clazz).items()
+            if not k.startswith('__')
+    }
 
-    def _init(*args, **kwargs):
-        inst = t(*args, **kwargs)
-        fact_set.add(inst)
-        return inst
+    class _AsFact(metaclass=FactMeta):
+        fact_guid = 0
 
-    return _init
+        def __init__(self, *args, **kwargs):
+            self.id = _AsFact.fact_guid
+            _AsFact.fact_guid += 1
+
+            for arg, val in members.items():
+                if type(val) == list: val = tuple(val)
+
+                setattr(self, arg, val)
+
+            for arg, val in zip(members.keys(), args):
+                if type(val) == list: val = tuple(val)
+
+                setattr(self, arg, val)
+
+            for arg, val in kwargs.items():
+                if arg not in members: raise TypeError
+                if type(val) == list:  val = tuple(val)
+
+                setattr(self, arg, val)
+            
+            fact_set.add(self)
+        
+        def __repr__(self) -> str:
+            return f'{_AsFact.__name__}[ {", ".join([str(getattr(self, k)) for k in members])} ]'
+
+    _AsFact.__name__ = clazz.__name__
+    return _AsFact
 
 
 globe = {}
@@ -717,17 +786,13 @@ def rule(fn) -> Callable:
     fn_name   = fn.__name__
     fn_params = list(signature.parameters.items())
 
-    def iterator(*args):
+    # as a class?
+    def f(*args):
         args         = list(args)
         call_count   = 0
         start_cursor = trace.cursor
 
         temporary_names = set()
-
-        if fn_name in p._predicates:
-            for tup in p._predicates[fn_name](*args):
-                out_fmt = tuple([f'{fn_params[i][0]} = {o}' for i, o in enumerate(tup)])
-                yield out_fmt
 
         while True:
             args_variable = []
@@ -742,21 +807,21 @@ def rule(fn) -> Callable:
 
                 elif arg == ...:
                     param_name, param = fn_params[i]
-                    annotation        = param.annotation
+                    annotation        = str(param.annotation)
 
                     new_domain = None
                     domain_set = set()
 
-                    if annotation == bool:
+                    if annotation == 'bool':
                         new_domain = Domain({True, False}, [], string=None)
 
-                    elif annotation == int:
+                    elif annotation == 'int':
                         new_domain = Domain(set(), string=None)
 
-                    elif annotation == str:
+                    elif annotation == 'str':
                         new_domain = Domain(set(), [], ...)
 
-                    elif annotation in [list, dict]:
+                    elif annotation in ['list', 'dict']:
                         ...
 
                     else:
@@ -781,8 +846,6 @@ def rule(fn) -> Callable:
                 outputs  = []
                 captures = {}
 
-                # cross product the results, but ensure that bound variables
-                # don't get applied to themselves.
                 for i, arg in enumerate(args_variable):
                     if type(arg) == Variable:
                         if hash(arg._capture) in captures:
@@ -795,8 +858,7 @@ def rule(fn) -> Callable:
 
                 for out in lazy_product(*outputs):
                     out_deref = tuple([out[o.cap] if type(o) == Ref else o for o in out])
-                    out_fmt   = tuple([f'{fn_params[i][0]} = {o}' for i, o in enumerate(out_deref)])
-                    yield out_fmt
+                    yield out_deref
 
             except NameError as e:
                 temporary_names.add(e.name)
@@ -822,9 +884,6 @@ def rule(fn) -> Callable:
         trace.cursor = start_cursor
         for n in temporary_names:
             del globe[n]
-
-    def f(*args):
-        return Output()
 
     return f
 
@@ -865,11 +924,11 @@ def repl(_globals):
 
             elif ':-' in query:
                 code = re.sub(r'([a-zA-Z_])+\s*\((.*)\)\s*:-(.*)', r'\1 = rule(lambda \2: T @ (\3,))', query)
-                exec(code, _globals, _globals)
+                exec(code, _globals, {})
 
             else:
                 valid = False
-                for i in eval(query, _globals, _globals):
+                for i in eval(query, _globals, {}):
                     valid = True
                     fmt   = '\n │  '.join([str(a) for a in i])
                     if input(f' │  {fmt} '):
